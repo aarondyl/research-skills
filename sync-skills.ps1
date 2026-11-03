@@ -1,5 +1,6 @@
 param(
     [string]$SkillsPath = (Join-Path $env:USERPROFILE '.codex/skills'),
+    [string[]]$SkillNames = @('paper-pdf-zh-mirror'),
     [switch]$Push
 )
 $ErrorActionPreference = 'Stop'
@@ -8,6 +9,7 @@ $sourcePath = (Resolve-Path -LiteralPath $SkillsPath).Path
 $destinationPath = Join-Path $repoPath 'skills'
 $allowedExtensions = @('.md', '.py', '.js', '.cjs', '.mjs', '.json', '.yaml', '.yml', '.txt', '.html', '.css', '.ps1', '.toml')
 foreach ($skill in Get-ChildItem -LiteralPath $sourcePath -Directory) {
+    if ($skill.Name -notin $SkillNames) { continue }
     if ($skill.Name.StartsWith('.') -or -not (Test-Path -LiteralPath (Join-Path $skill.FullName 'SKILL.md'))) { continue }
     foreach ($file in Get-ChildItem -LiteralPath $skill.FullName -Recurse -File) {
         $relative = $file.FullName.Substring($skill.FullName.Length + 1)
