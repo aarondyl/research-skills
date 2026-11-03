@@ -1,0 +1,324 @@
+# 将图像思考作为连续动作：数值视觉思维链
+Kesen Zhao¹、Beier Zhu²（通讯作者）、Junbao Zhou¹、Xingyu Zhu³、Zhongqi Yue⁴、Hanwang Zhang¹。
+¹南洋理工大学；²中国科学技术大学；³新加坡国立大学；⁴微软研究院。通讯：Beier Zhu，beier.zhu@ustc.edu.cn。
+## 摘要
+近年来，多模态大语言模型（Multimodal Large Language Model, MLLM）日益依赖视觉思维链（Visual Chain-of-Thought, Visual CoT），对图像进行以区域定位为依据的推理。然而，现有方法通过文本化坐标或固定粒度的图像块来定位区域：前者导致模态不匹配和语义碎片化，后者限制精确区域选择，而且往往需要较大幅度的架构修改。本文提出数值视觉思维链（Numerical Visual Chain-of-Thought，NV-CoT），使 MLLM 能够使用连续数值坐标对图像进行推理。NV-CoT 将模型动作空间从离散词表 词元 扩展至连续欧氏空间，仅需极少架构修改，就能直接生成作为动作的边界框坐标。
+该框架同时支持监督微调（Supervised Fine-Tuning, SFT）和强化学习（Reinforcement Learning, RL）。具体而言，我们用坐标上的高斯策略（Gaussian Policy）或拉普拉斯策略（Laplace Policy）替代类别分布词元策略，并通过重参数化采样（Reparameterized Sampling）引入随机性，使 NV-CoT 完全兼容 GRPO 风格的策略优化。在三个基准上与 11 种代表性视觉推理基线进行的大量实验表明，NV-CoT 显著提高定位精度和最终答案准确率，同时加快训练收敛，验证了 MLLM 中连续动作视觉推理的有效性。项目主页：kesenzhao.github.io/NV-CoT/。
+## 图 1：不同图像思考范式的比较
+问题：左边的男子手里拿着什么？（a）基于文本的视觉思维链：文本空间中的边界框为 [“48”, “21”, “607”, “459”]；将“6”等建模为离散 词元，示例答案为“胡椒研磨器”。（b）基于图像块的视觉思维链：依赖固定图像块粒度和架构修改，示例答案为“相机”。（c）本文的数值视觉思维链：欧氏空间中的边界框为 [42.2, 21.4, 522.6, 450.1]；将 522.6 建模为连续值，示例答案为“瓶子”。
+文本方法将定位区域表示成离散坐标 词元，导致模态不匹配与语义碎片化；图像块方法直接对细粒度视觉 词元 推理，但受视觉骨干固定空间粒度约束；NV-CoT 在连续空间预测区域坐标，支持灵活而精确的定位。
+## 1 引言
+多模态大语言模型近期的进展，使其能够通过“用图像思考”（Thinking with Images，即视觉思维链）对视觉输入开展更深入的推理 [1–5]。在这一范式中，模型首先定位与文本问题相对应的任务相关图像区域，然后将中间推断明确建立在这些检测到的区域之上，开展多步推理。这种以区域为依据的视觉推理是 MLLM 的一项基础能力，并支撑着广泛的下游应用。
+第 40 届神经信息处理系统大会（NeurIPS 2026）。arXiv:2602.23959v2 [cs.CV]，2026 年 10 月 15 日。
+===PAGE===
+## 图 2：定位精度与最终答案准确率
+NV-CoT 在 SFT 和 RL 中的定位精度、答案准确率与收敛速度均优于基于文本的视觉思维链模型 Vis-CoT [2] 和 DeepEyes [1]。基于 SFT 的模型在提供真实边界框的 Vis-CoT-363K 数据集 [2] 上评估，基于 RL 的模型在 DeepEyes-47K 数据集 [1] 上评估。为保证公平，仅将文本空间中的离散坐标目标替换为欧氏空间中的连续目标，其余训练设置保持不变。
+为适配基于文本的输出接口，许多现有模型 [6–8] 将定位区域序列化成文本边界框坐标，例如 [“x₁”, “y₁”, “x₂”, “y₂”]，再调用裁剪工具提取对应图像块（图 1a）。这种设计虽然简单，却有两个根本问题。（1）模态不匹配：视觉世界中的坐标是连续值，但模型将其预测为离散文本 词元，通常用交叉熵训练，忽略几何接近性。例如目标为 x₁*=“3.1”时，“3.2”和“4.1”在 词元 级交叉熵下都只与目标相差一个离散 词元，因此可能受到相似惩罚。（2）语义碎片化：数字被切分成多个互不相关的子 词元，导致数值比较和推理脆弱、容易产生幻觉，例如混淆“3.11”和“3.9”谁更大。
+近期一些研究让 MLLM 直接操作细粒度视觉图像块（图 1b），以缓解上述问题。例如 LVR [9] 在视觉嵌入空间推理，PaDT [10] 生成原始视觉图像块嵌入的索引。然而，视觉骨干的固定粒度及预定义图像块划分，从根本上限制了灵活、精确的区域选择。此外，图像块生成或索引机制往往需要较大架构改动，削弱模块化，并限制跨模型通用性。
+为避免脆弱的文本化坐标，同时尽量减少架构改动，我们提出 NV-CoT：将动作空间从离散词表 词元 扩展至连续欧氏空间，使模型能够直接生成数值边界框坐标作为动作（图 1c）。具体而言，在标准 LLM 输出头上增加四个坐标输出，直接预测 [x₁, y₁, x₂, y₂]。NV-CoT 同时适用于监督微调（SFT）和强化学习（RL）。SFT 阶段用回归损失代替 词元 级交叉熵来监督连续边界框坐标，但将其扩展至 RL 并不简单。大多数面向 LLM 的策略优化方法将策略参数化为词表上的 词元 级类别分布，只天然支持离散动作，不能直接容纳连续坐标输出；确定性坐标预测也缺乏 GRPO 风格算法进行优势估计和策略探索所需的随机性。
+为此，我们用显式建模连续坐标回归的高斯策略替代类别策略。模型预测边界框分布的均值和标准差，再通过重参数化技巧采样坐标，引入随机性。这一设计支持高效探索与稳定梯度传播，并提供可用于重要性比值与 KL 正则化的闭式似然，使 NV-CoT 兼容 GRPO 风格 RL。考虑到 ℓ₁ 型损失在定位中表现出的稳健性与良好性能，我们还提供拉普拉斯策略变体，可在同一 GRPO 流程中直接替换高斯策略。
+注 1：本文用 [“x₁”, “y₁”, “x₂”, “y₂”] 表示文本坐标，用 [x₁, y₁, x₂, y₂] 表示数值坐标。
+===PAGE===
+图 2 展示了训练过程中边界框精度（具有真实坐标的 SFT 设置下的交并比（Intersection over Union, IoU））和最终答案准确率。NV-CoT 持续提高定位准确率、最终答案准确率与收敛速度。在 V* Bench [11]、HR-Bench 4K [12] 和 HR-Bench 8K [12] 上的大量实验表明，其能够稳定提升视觉推理表现。例如，V* Bench 上 NV-CoT-7B 分别比图像块方法 LVR-7B、文本方法 DeepEyes-7B 高 7.8% 和 2.6%（表 1）。除高分辨率基准外，它在 MMMU-Pro、ChartQA、OCRBenchv2 等通用多模态基准上也优于基线（表 2），保留纯文本推理性能（表 3），并在 RefCOCO 系列、COCO 检测、CountBenchQA 和 TallyQA 等定位与计数基准上优于 Qwen2.5-VL-7B 与 DeepEyes-7B（表 4）。
+## 2 相关工作
+**多模态大语言模型。** 将语言建模与视觉理解结合后，MLLM 能完成复杂视觉语言任务。早期代表模型 BLIP-2 [16] 和 LLaVA [17,18] 通过查询 Transformer 或轻量投影器将图像映射到冻结 LLM 的潜在空间，实现视觉语言对齐。随后，LLaVA 系列 [19–24]、Qwen-VL [7,25,26]、InternVL [27,28] 等强大的开源模型进一步改善分辨率处理和扩展能力。尽管感知与对齐能力很强，这些模型通常缺乏显式推理机制。
+**用图像思考（视觉 CoT）。** 近期 MLLM 积极探索通过 CoT 推理增强视觉理解 [29,30]。早期文本方法 [6–8] 将局部图像区域序列化为文本边界框坐标，再调用裁剪工具提取视觉图像块。该范式有效，但有模态不匹配和语义碎片化问题。较新的图像块方法 [9,10,31] 直接操作细粒度视觉图像块，避免显式文本序列化，却受视觉骨干固定空间粒度限制，影响区域选择灵活性和推理精度。相比之下，NV-CoT 把动作空间从离散词表扩展到连续欧氏空间，直接将数值边界框坐标作为连续动作预测，无需固定图像块划分，自然衔接视觉感知和推理。
+现有方法通过监督微调 [2,32–34] 或强化学习 [1,3,5,30] 将 CoT 引入 MLLM。本文同时兼容两种范式，为连续视觉动作学习提供统一框架。
+## 3 方法
+给定问题 q 和图像 I₀，视觉 CoT 模型 πθ 通过选择感兴趣区域、调用放大函数进行细粒度观察，完成基于区域的推理。现有方法生成文本形式的框坐标，再裁剪图像获得反馈；我们则把定位视为欧氏空间中的连续动作问题，由模型直接输出数值坐标。
+方法包括：扩展 MLLM 词表，加入连续坐标动作空间（§3.1）；在有框监督时，以坐标回归构建 SFT 版 NV-CoT（§3.2）；引入具有闭式重要性比值和 KL 正则项的随机高斯策略，扩展到 GRPO（§3.3）；最后，受定位中 ℓ₁ 型损失经验优势启发，提供可直接替换的拉普拉斯策略（§3.4）。
+## 3.1 面向连续坐标的动作扩展
+在词表 V 上的标准 LLM 输出头之外，增加连续动作空间 A=ℝ⁴×ℝ₊：四个坐标头由 W=[wₓ₁,wᵧ₁,wₓ₂,wᵧ₂]ᵀ∈ℝ⁴ˣᴰ 参数化，用于预测高斯均值；第五个头 wσ∈ℝᴰ 预测共享标准差，构成连续定位的高斯策略。设坐标解码前最后的隐藏表示为 h∈ℝᴰ，则……
+===PAGE===
+均值与共享标准差为：
+【公式 1】μ=[x₁,y₁,x₂,y₂]ᵀ=Wh，σ=max(wσᵀh, ε)。
+其中 ε>0 是保证 σ>0 的小正数，从而构成高斯策略 N(μ,σ²I)。参数集合相应扩展为 θ←θ∪{W,wσ}。
+引入 σ 至关重要：确定性坐标虽然足够用于 SFT，GRPO 风格 RL 却需要随机策略以支持采样和探索。我们只增加五个轻量线性头，架构修改极少，而基于图像块的视觉 CoT 通常需要更多结构变动。
+## 3.2 用于监督微调的 NV-CoT
+首先考虑推理过程的中间边界框坐标可用的 SFT 设置 [2,34]。令 b*=[x₁*,y₁*,x₂*,y₂*]ᵀ 表示一次放大操作的真实框。在 SFT 中，对 A 中的坐标输出使用 ℓ₂² 回归损失，对原 LLM 头 V 中的离散 词元 输出继续使用标准交叉熵损失（Cross-Entropy Loss）：
+L_SFT(θ)=Σ[t∈T_V] −log πθ(o_t|o_<t,q,I₀) + λΣ[t∈T_A] ‖μ_t−b*_t‖₂²。
+T_V={t:o_t∈V}、T_A={t:o_t∈A} 分别是文本 词元 与坐标动作的位置；o_t 为 LLM 输出，λ>0 为超参数。SFT 不监督 σ；σ 仅用于 RL。
+## 3.3 用于强化学习的 NV-CoT
+SFT 所需边界框标注成本高，通常难以大规模获得。因此，视觉 CoT 模型通常采用 RL（GRPO，Shao 等 [35]），将任务级反馈（例如最终答案）作为奖励信号，而无需框级监督。但 RL 要求随机采样和定义良好的重要性比值，而标准 LLM 的 词元 级类别策略无法容纳连续坐标动作。为此，在动作空间 A 上使用高斯策略描述连续区域定位。
+**轨迹采样。** GRPO 为每个提示采样 G 条轨迹。独立采样坐标动作 b⁽ⁱ⁾∼N(μ,σ²I)，i=1,…,G，并采用重参数化技巧实现低方差梯度估计：
+【公式 2】b⁽ⁱ⁾=μ+σε⁽ⁱ⁾，ε⁽ⁱ⁾∼N(0,I)。
+然后使用 b⁽ⁱ⁾ 为第 i 条轨迹裁剪图像。
+**重要性比值。** GRPO 通过当前策略 πθ 与参考策略 πθold 之间的重要性比值来优化策略。对每个输出 o_t⁽ⁱ⁾：
+【公式 3】r_t⁽ⁱ⁾(θ)=πθ(o_t⁽ⁱ⁾|q,I₀,o_<t⁽ⁱ⁾)/πθold(o_t⁽ⁱ⁾|q,I₀,o_<t⁽ⁱ⁾)。
+文本 词元 使用标准类别策略似然比。连续坐标动作 b_t⁽ⁱ⁾ 使用高斯似然：
+【公式 4】r=N(b|μθ,σθ²I)/N(b|μold,σold²I)，N(b|μ,σ²I)=(2πσ²)^(−d/2) exp[−‖b−μ‖₂²/(2σ²)]。
+取 d=4，得到以平方马氏距离表示的比值：
+【公式 5】r=(σold⁴/σθ⁴) exp[−‖b−μθ‖₂²/(2σθ²)+‖b−μold‖₂²/(2σold²)]。
+===PAGE===
+**KL 惩罚。** 高斯分布具有闭式 Kullback–Leibler 散度（Kullback–Leibler Divergence, KL Divergence），因此连续动作 A 的惩罚可以解析计算：
+【公式 6】KL(πθ‖πref)=‖μθ−μref‖₂²/(2σref²)+2(σθ²/σref²−log σθ²)+C。
+C 为常数。但 SFT 未监督 σ，因此 σref 未知。故去掉与方差有关的项，只约束均值：KLμ(πθ‖πref)=‖μθ−μref‖₂²。如果没有 SFT 阶段，无法得到参考均值 μref，就省略该正则项。文本 词元 仍使用标准 词元 级 KL 散度。
+**奖励。** 沿用 DeepEyes [1]，将答案正确性、格式有效性和有条件的放大使用奖励相结合：
+【公式 7】R(o⁽ⁱ⁾)=R_acc(o⁽ⁱ⁾)+R_fmt(o⁽ⁱ⁾)+R_zoom(o⁽ⁱ⁾)。
+只有当轨迹答案正确且至少一次调用视觉定位动作时，才激活放大奖励，以鼓励识别感兴趣区域。
+**优化。** 对问题 q 和输入图像 I₀，从 πθold 采样 G 条轨迹及对应的中间框（公式 2），按公式 7 计算各轨迹奖励 R。第 i 条轨迹的全部步骤使用同一归一化优势：A_t⁽ⁱ⁾=[R(o⁽ⁱ⁾)−mean(R)]/std(R)。结合前述比值和 KL 项，优化目标为：
+【公式 8】L_GRPO(θ)=E[ (1/GT)ΣᵢΣₜ min(r_t⁽ⁱ⁾A_t⁽ⁱ⁾, clip(r_t⁽ⁱ⁾,1−ε,1+ε)A_t⁽ⁱ⁾) − βKL(πθ‖πref) ]。
+其中 ε>0 为裁剪范围。
+**推理。** 推理时关闭随机性，用坐标均值 μ 裁剪；所有迭代放大框均在原始图像坐标系中表示。
+## 3.4 将 NV-CoT 扩展为拉普拉斯策略
+在关键点定位和边界框回归等任务中，ℓ₁ 损失因对离群值更稳健、误差轮廓更尖锐，往往优于ℓ₂² 损失 [36,37]。从概率角度看，这对应于用拉普拉斯分布而非高斯分布建模误差。因此，我们进一步用拉普拉斯策略替代高斯策略进行连续定位。
+**拉普拉斯策略。** 将坐标动作建模为 b∼Laplace(μ,α)，概率密度为：
+【公式 9】p(b|μ,α)=(2α)⁻⁴ exp[−‖b−μ‖₁/α]。
+μ∈ℝ⁴ 表示预测坐标均值，α>0 为共享尺度参数；等价地，假设各维独立，拉普拉斯似然可按坐标分解。
+**SFT 目标。** 在拉普拉斯假设下，最大化真实坐标的对数似然等价于最小化 ℓ₁ 损失，因为 −log p(b*|μ,α)=‖μ−b*‖₁/α+常数。因此在 SFT 阶段用下式替换ℓ₂² 项：
+【公式 10】L_SFT^Lap(θ)=Σ[t∈Y_A] ‖μ_t−b*_t‖₁。
+该目标鼓励更精确、稳健的定位。
+===PAGE===
+**拉普拉斯策略下的 RL。** 与高斯情形类似，用位置参数 μ 和尺度参数 α 参数化策略，并采用重参数化采样以进行低方差梯度估计：
+【公式 11】b=μ+αs⊙ε，s∼Rademacher(±1)，ε∼Exp(1)。
+⊙ 为逐元素乘法；s 是各元素独立同分布、取值 ±1 的随机符号向量；ε 各元素独立服从单位速率指数分布。采样动作 b_t⁽ⁱ⁾ 的 GRPO 重要性比值为：
+【公式 12】r=(αold⁴/αθ⁴) exp[−‖b−μθ‖₁/αθ+‖b−μold‖₁/αold]。
+该比值可解析计算；闭式 KL 惩罚可类似推导，整体 GRPO 流程与高斯策略相同。
+## 4 实验
+§4.1 介绍设置，§4.2 报告高分辨率基准结果，§4.3 展示通用多模态、纯文本、定位和计数任务结果，§4.4 进行消融，以及不确定性、训练系数、训练动态与定性定位分析。
+## 4.1 设置
+**基线。** 比较 11 种先进 MLLM 基线，分四类：（1）开源 MLLM：Qwen2.5-VL-{7B,32B} [7]、LLaVA-OneVision [24]；（2）无需训练的视觉 CoT：DyFo-7B [38]；（3）SFT 视觉 CoT：Vis-CoT-7B [2]、ZoomEye-7B [39]、RAP-7B [40]；（4）RL 视觉 CoT：UV-CoT-7B [3]、DeepEyes-7B [1]、PaDT [10]、LVR [9]。本文的 SFT 模型以 Vis-CoT 为基础，RL 模型以 DeepEyes 为基础。
+**数据集。** 为公平比较，使用与相应骨干完全相同的训练数据。评估涵盖四类：（1）高分辨率视觉推理：V* Bench 的属性（Attr）和空间推理（Spatial），以及 HR-Bench 4K/8K 的细粒度空间感知（Fine-grained Spatial Perception, FSP）与细粒度比较感知（Fine-grained Comparison Perception, FCP）；（2）通用多模态理解：MMMU-Pro 的多学科理解、ChartQA 的图表推理、OCRBenchv2 的视觉文本推理；（3）定位与计数：RefCOCO、RefCOCO+、RefCOCOg 的指代表达定位，COCO 的目标检测，CountBenchQA 和 TallyQA 的视觉计数；（4）纯文本推理：MMLU 的语言推理与 GSM8K 的数学推理。
+**评估协议。** 为在相同推理扩展条件下公平比较，所有模型每个问题只允许一次放大，因为 Vis-CoT、UV-CoT 等不支持迭代工具调用。对支持多次调用的 DeepEyes 和 NV-CoT（RL），另报告多次使用工具的结果。
+**实现细节。** 训练配置与 DeepEyes-7B、Vis-CoT-7B 完全一致，仅用连续动作形式替换文本坐标预测。SFT：微调 LLaVA 一个 epoch，批量 128，Adam，权重衰减 0，学习率 2×10⁻⁵，余弦学习率调度，公式（2）中的 λ 设为 0.3。RL：在 Qwen2.5-VL-7B 上用 GRPO，在 32 张 A100 GPU 上训练 80 次迭代，批量 256，组大小 G=16，KL 系数 β=0。
+## 4.2 高分辨率基准上的主要结果
+整体性能比较见表 1，由此得到以下观察。
+===PAGE===
+## 表 1：高分辨率基准结果
+最优结果在原表中加粗。NV-CoT 在 SFT 和 RL 下均持续改善性能。SFT 使用 ℓ₁ 损失，RL 使用拉普拉斯策略。† 表示多步工具使用（多次放大）；其余视觉 CoT 方法均仅调用一次放大工具，以适配不支持多次调用的基线。
+@TABLE1@
+## 表 2：通用多模态基准上的性能比较
+NV-CoT 在 MMMU-Pro、ChartQA、OCRBenchv2 上均取得最优结果。按此顺序：Qwen2.5-VL-7B：38.3 / 58.9 / 44.7；DeepEyes-7B：44.6 / 62.5 / 46.1；NV-CoT-7B：46.7 / 65.1 / 47.6。
+（1）NV-CoT 在 SFT 与 RL 下、所有基准上均优于骨干。SFT 相对 Vis-CoT-7B，在 V*、4K、8K 总体分别提高 3.7%、2.0%、1.6%；RL 相对 DeepEyes-7B 分别提高 2.6%、1.3%、1.6%。说明用数值框预测替代文本框预测，对两种训练范式均有益。
+（2）放大型视觉 CoT 相对图像块推理具有明显范式优势。DeepEyes-7B 和 NV-CoT（RL）在所有基准上均优于 PaDT-7B、LVR-7B，表明通过放大选择区域比对固定粒度图像块推理更有效。
+（3）使用图像思考的方法明显优于 LLaVA-OneVision-7B、Qwen2.5-VL-7B 等基础模型。NV-CoT 尽管基于 7B 骨干，在所有基准上仍超过 Qwen2.5-VL-32B，凸显基于区域的视觉推理对多模态理解的重要作用。
+（4）允许多次放大进一步改善图像思考，说明迭代选择和细化区域有利于细粒度推理。DeepEyes-7B† 持续优于单次调用版；在更强的多步设置下，NV-CoT† 以连续坐标动作替换文本坐标，进一步提高定位精度和性能。
+===PAGE===
+## 表 3：纯文本推理性能
+NV-CoT 在 MMLU 和 GSM8K 上保持与 Qwen2.5-VL-7B 相近的性能。Qwen2.5-VL-7B：70.88 / 73.84；NV-CoT-7B：71.07 / 73.54。
+## 表 4：定位和计数基准性能
+NV-CoT 持续优于强基线。列依次为 RefCOCO / RefCOCO+ / RefCOCOg / COCO / CountBenchQA / TallyQA。Qwen2.5-VL-7B：87.1 / 79.7 / 83.0 / 19.5 / 77.4 / 71.2；DeepEyes-7B：88.5 / 81.5 / 85.1 / 22.8 / 81.9 / 75.9；NV-CoT-7B：91.7 / 85.0 / 87.4 / 27.4 / 86.2 / 80.5。
+## 表 5：坐标策略与不确定性参数化消融
+比较高斯（ℓ₂²）与拉普拉斯（ℓ₁），以及共享与逐坐标 σ/α。非共享设置由四个头分别预测尺度（标准差）。拉普拉斯持续优于高斯，共享与独立参数表现相近。
+@TABLE5@
+## 4.3 高分辨率基准之外的结果
+**通用多模态基准。** 为检验定位专用基准以外的泛化性，在 MMMU-Pro、ChartQA、OCRBenchv2 上开展实验。表 2 显示 NV-CoT 持续优于基础 VLM 和 DeepEyes，说明该方法没有损害一般推理能力，而带来了互补增益。
+**纯文本推理。** 为检验坐标分支是否影响语言推理，在 MMLU 与 GSM8K（采用严格匹配标准，strict-match）上比较基础 Qwen2.5-VL-7B 与 NV-CoT。MMLU 得分为 71.07% 对 70.88%，GSM8K 为 73.54% 对 73.84%，表明纯文本任务性能相当（表 3）。
+**目标检测基准。** 表 4 评估标准定位基准与依赖定位的计数任务：RefCOCO 系列、COCO 检测、CountBenchQA、TallyQA。单目标定位报告准确率；COCO 多目标检测按标准协议报告平均精度均值（mean Average Precision, mAP）。结果进一步表明该方法具有很强的定位能力。
+## 4.4 消融研究与分析
+对坐标策略与不确定性参数化进行消融，并分析不确定性行为、训练系数、RL 动态和定性定位。
+**回归损失与策略分布。** 两阶段均以连续方式建模坐标，因此联合分析 SFT 的回归损失与 RL 的策略分布。SFT 中 ℓ₁ 在所有基准上优于ℓ₂²：V* 总体提高 1.6%，4K 提高 1.1%，8K 提高 0.8%。趋势延续到 RL：拉普拉斯在所有基准上持续优于高斯（表 5），与边界框、关键点回归中 ℓ₁ 类目标对定位更稳健的既有观察一致。此外，在 SFT 设置下，我们进一步测量了 Vis-CoT-363K 验证集上的边界框交并比（Intersection over Union, IoU）。
+===PAGE===
+## 图 3：α 的行为
+成功轨迹的 α 小于失败轨迹，反映更高置信度。图中 Failure/Success 分别表示失败/成功，纵轴为 α 的均值。
+## 表 6：Vis-CoT-363K 数据集上的边界框 IoU
+Vis-CoT：47.3；NV-CoT（ℓ₂²）：57.4；NV-CoT（ℓ₁）：59.5。NV-CoT 大幅提高定位精度，ℓ₁ 优于ℓ₂²。
+## 图 4：λ 的影响
+λ=0.3 时性能最高；所有 λ 值下 NV-CoT 均优于基线。Acc. 表示准确率，Baseline Performance 表示基线性能。
+表 6 显示 NV-CoT 显著提高定位准确率，其中 ℓ₁ 的 IoU 最优。
+**共享与独立 σ/α。** 我们进一步研究了分散程度参数应在各坐标之间共享，还是对各坐标独立预测。以高斯为例，用四个额外的头 Σ=[wσ,x₁,wσ,y₁,wσ,x₂,wσ,y₂]ᵀ 预测各坐标标准差：
+【公式 13】σ=[σ₁,σ₂,σ₃,σ₄]ᵀ=max(Σh,ε)。
+这推广了公式 1 的共享方差形式。重要性比值变为：
+【公式 14】r(θ)=∏[j=1…4] (σold,j/σθ,j) exp[−(b_j−μθ,j)²/(2σθ,j²)+(b_j−μold,j)²/(2σold,j²)]。
+拉普拉斯策略类似。表 5 显示共享与独立设置在各基准上差异很小，因此最终模型采用共享 σ/α，以求简单高效。
+**α 的行为分析。** 图 3 比较成功与失败样例的拉普拉斯尺度 α 均值，对不同分辨率结果进行归一化。成功轨迹的 α 始终更小，说明准确定位对应较低预测不确定性，使边界框采样分布更集中。
+**λ 的影响。** 图 4 将公式（2）中的 λ 从 0.1 变化至 0.9，报告三个基准的总体准确率。λ=0.3 最佳，同时在较大范围内准确率相对稳定。所有 λ 设置下都明显优于文本基线，说明性能增益稳健，对 λ 选择不敏感。
+**RL 训练诊断。** 为刻画训练过程、判断是否一种动作主导优化，图 5 跟踪平均奖励及每条轨迹的工具调用次数。平均奖励从 0.2 升至 1.4；工具调用次数在训练进度 60% 时达到 1.8 次峰值，随后降至 1.3。表 7 显示文本与坐标动作的重要性比值均值、裁剪比例相近，归一化梯度范数贡献分别为 54% 和 46%。因此，奖励提高并不伴随工具使用持续增加，两类动作之间也无显著优化失衡。
+**定性定位可视化。** 图 6 比较 NV-CoT 与骨干定位。骨干经常给出粗糙或对齐松散的框，包含多余背景或漏掉物体部分；NV-CoT 框更紧密、更符合目标范围，体现更好的定位。
+===PAGE===
+## 图 5：RL 训练动态
+平均奖励随训练持续增长；每条轨迹平均工具调用次数在进度 60% 处达到峰值，之后下降。横轴为训练进度，纵轴为均值。
+## 表 7：文本和坐标动作的 RL 策略统计
+裁剪 ε=0.2；梯度范数占比在两个分支间归一化。文本 词元 / 坐标动作：比值均值 1.012 / 1.018；比值标准差 0.071 / 0.093；裁剪比例 4.6% / 6.8%；梯度占比 54% / 46%。
+## 图 6：边界框可视化
+NV-CoT（红色）比骨干（蓝色）给出更准确的框，显示更强定位能力。（a）强化学习；（b）监督微调。
+图中问题与答案：手提包是什么颜色？真实答案：黄色；NV-CoT：黄色；DeepEyes：白色。蓝色长椅位于绿色门左侧还是右侧？真实答案：左侧；NV-CoT：左侧；DeepEyes：白色。化学品和耗材的费用是多少？真实答案：485 美元；NV-CoT：485 美元；Vis-CoT：685 美元。什么东西接触着泰迪熊？真实答案：笔记本电脑；NV-CoT：笔记本电脑；Vis-CoT：瓶子。
+## 5 结论与局限
+本文提出即插即用框架 NV-CoT，使 MLLM 直接生成连续边界框坐标，而非文本 词元。通过将定位建模为高斯/拉普拉斯策略下的连续动作问题，NV-CoT 同时支持监督微调与强化学习。它缓解文本视觉 CoT 的模态不匹配与语义碎片化，避免图像块设计的固定粒度限制，且只需极少架构修改。
+在高分辨率、通用多模态、定位与计数基准上的实验显示，视觉推理与定位持续改善，纯文本任务性能仍与基础模型相当；同时最终答案准确率提高、收敛加快。
+我们承认，NV-CoT 专注于提高视觉定位能力，无法解决底层 MLLM 未能正确理解图像或任务的情况。不过，当模型具有合理理解、但定位不准时，连续坐标预测能够持续提高精度。
+===PAGE===
+## 致谢与披露
+**资助。** 本研究获新加坡国家研究基金会 AI Singapore 计划支持（AISG3-RP-2022-030），并获该基金会项目 NRF-NRFI10-2024-0004 支持。
+**利益冲突。** 作者声明不存在利益冲突。
+## 参考文献 [1–14]
+[1] Ziwei Zheng, Minghao Yang, Jack Hong, Chenxiao Zhao, Guohai Xu, Le Yang, Chao Shen, and Xing Yu. DeepEyes：通过强化学习激励“用图像思考”。 载于：ICLR, 2026.
+[2] Hao Shao, Shengju Qian, Han Xiao, Guanglu Song, Zhuofan Zong, Letian Wang, Yu Liu, and Hongsheng Li. Visual CoT：通过全面的思维链推理数据集和基准推进多模态语言模型。 载于：NeurIPS, 2024.
+[3] Kesen Zhao, Beier Zhu, Qianru Sun, and Hanwang Zhang. 通过偏好优化进行无监督视觉思维链推理。 载于：ICCV, 2025.
+[4] Chengzu Li, Wenshan Wu, Huanyu Zhang, Yan Xia, Shaoguang Mao, Li Dong, Ivan Vuli´c, and Furu Wei. 在空间推理时想象：多模态思维可视化。 载于：ICML, 2025.
+[5] Zhaochen Su, Linjie Li, Mingyang Song, Yunzhuo Hao, Zhengyuan Yang, Jun Zhang, Guanjie Chen, Jiawei Gu, Juntao Li, Xiaoye Qu, et al. OpenThinkIMG：通过视觉工具强化学习学会用图像思考。 arXiv preprint arXiv:2505.08617, 2025.
+[6] Yuqi Liu, Tianyuan Qu, Zhisheng Zhong, Bohao Peng, Shu Liu, Bei Yu, and Jiaya Jia. Vision-Reasoner：通过强化学习实现融合推理的统一视觉感知。 载于：ICLR, 2026.
+[7] Shuai Bai, Keqin Chen, Xuejing Liu, Jialin Wang, Wenbin Ge, Sibo Song, Kai Dang, Peng Wang, Shijie Wang, Jun Tang, et al. Qwen2.5-VL 技术报告。 arXiv preprint arXiv:2502.13923, 2025.
+[8] Jinguo Zhu, Weiyun Wang, Zhe Chen, Zhaoyang Liu, Shenglong Ye, Lixin Gu, Hao Tian, Yuchen Duan, Weijie Su, Jie Shao, et al. InternVL3：探索开源多模态模型的先进训练与测试时策略。 arXiv preprint arXiv:2504.10479, 2025.
+[9] Bangzheng Li, Ximeng Sun, Jiang Liu, Ze Wang, Jialian Wu, Xiaodong Yu, Emad Barsoum, Muhao Chen, and Zicheng Liu. 潜在视觉推理。 载于：ICLR, 2026.
+[10] Yongyi Su, Haojie Zhang, Shijie Li, Nanqing Liu, Jingyi Liao, Junyi Pan, Yuan Liu, Xiaofen Xing, Chong Sun, Chen Li, Nancy Chen, Shuicheng Yan, Xulei Yang, and Xun Xu. 图像块作为可解码 词元：迈向 MLLM 中统一的多模态视觉任务。 载于：ICLR, 2026.
+[11] Penghao Wu and Saining Xie. V*：作为多模态大语言模型核心机制的引导式视觉搜索。 载于：CVPR, 2024.
+[12] Wenbin Wang, Liang Ding, Minyan Zeng, Xiabin Zhou, Li Shen, Yong Luo, Wei Yu, and Dacheng Tao. 分而治之再组合：多模态大语言模型中无需训练的高分辨率图像感知框架。 载于：AAAI, 2025.
+[13] Xiang Yue, Tianyu Zheng, Yuansheng Ni, Yubo Wang, Kai Zhang, Shengbang Tong, Yuxuan Sun, Botao Yu, Ge Zhang, Huan Sun, Yu Su, Wenhu Chen, and Graham Neubig. MMMU-Pro：更稳健的多学科多模态理解基准。 载于：ACL, 2025.
+[14] Ahmed Masry, Do Xuan Long, Jia Qing Tan, Shafiq Joty, and Enamul Hoque. ChartQA：用于结合视觉与逻辑推理进行图表问答的基准。 载于：ACL Findings, 2022.
+===PAGE===
+## 参考文献 [15–32]
+[15] Ling Fu, Zhebin Kuang, Jiajun Song, Mingxin Huang, Biao Yang, Yuzhe Li, Linghao Zhu, Qidi Luo, Xinyu Wang, Hao Lu, Zhang Li, Guozhi Tang, Bin Shan, Chunhui Lin, Qi Liu, Binghong Wu, Hao Feng, Hao Liu, Can Huang, Jingqun Tang, Wei Chen, Lianwen Jin, Yuliang Liu, and Xiang Bai. OCRBench v2：评估大型多模态模型视觉文本定位与推理的改进基准。 载于：NeurIPS, 2025.
+[16] Junnan Li, Dongxu Li, Silvio Savarese, and Steven Hoi. BLIP-2：借助冻结图像编码器和大语言模型启动语言图像预训练。 载于：ICML, 2023.
+[17] Haotian Liu, Chunyuan Li, Qingyang Wu, and Yong Jae Lee. 视觉指令微调。 载于：NeurIPS, 2023.
+[18] Haotian Liu, Chunyuan Li, Yuheng Li, and Yong Jae Lee. 通过视觉指令微调改进基线。 载于：CVPR, 2024.
+[19] Shilong Liu, Hao Cheng, Haotian Liu, Hao Zhang, Feng Li, Tianhe Ren, Xueyan Zou, Jianwei Yang, Hang Su, Jun Zhu, et al. LLaVA-Plus：学习使用工具以创建多模态智能体。 载于：ECCV, 2024.
+[20] Zonghao Guo, Ruyi Xu, Yuan Yao, Junbo Cui, Zanlin Ni, Chunjiang Ge, Tat-Seng Chua, Zhiyuan Liu, and Gao Huang. LLaVA-UHD：可感知任意宽高比及高分辨率图像的大型多模态模型。 载于：ECCV, 2024.
+[21] Shaolei Zhang, Qingkai Fang, Zhe Yang, and Yang Feng. LLaVA-Mini：只用一个视觉 词元 的高效图像和视频大型多模态模型。 载于：ICLR, 2025.
+[22] Bin Lin, Yang Ye, Bin Zhu, Jiaxi Cui, Munan Ning, Peng Jin, and Li Yuan. Video-LLaVA：通过先对齐后投影学习统一视觉表示。 载于：EMNLP, 2024.
+[23] Chunyuan Li, Cliff Wong, Sheng Zhang, Naoto Usuyama, Haotian Liu, Jianwei Yang, Tristan Naumann, Hoifung Poon, and Jianfeng Gao. LLaVA-Med：一天内训练面向生物医学的大型语言视觉助手。 载于：NeurIPS, 2023.
+[24] Bo Li, Yuanhan Zhang, Dong Guo, Renrui Zhang, Feng Li, Hao Zhang, Kaichen Zhang, Peiyuan Zhang, Yanwei Li, Ziwei Liu, et al. LLaVA-OneVision：轻松实现视觉任务迁移。 TMLR, 2025.
+[25] Jinze Bai, Shuai Bai, Yunfei Chu, Zeyu Cui, Kai Dang, Xiaodong Deng, Yang Fan, Wenbin Ge, Yu Han, Fei Huang, et al. Qwen 技术报告。 arXiv preprint arXiv:2309.16609, 2023.
+[26] Peng Wang, Shuai Bai, Sinan Tan, Shijie Wang, Zhihao Fan, Jinze Bai, Keqin Chen, Xuejing Liu, Jialin Wang, Wenbin Ge, et al. Qwen2-VL：增强视觉语言模型对任意分辨率世界的感知。 arXiv preprint arXiv:2409.12191, 2024.
+[27] Zhe Chen, Jiannan Wu, Wenhai Wang, Weijie Su, Guo Chen, Sen Xing, Muyan Zhong, Qinglong Zhang, Xizhou Zhu, Lewei Lu, et al. InternVL：扩展视觉基础模型并对齐通用视觉语言任务。 载于：CVPR, 2024.
+[28] Dongchen Lu, Yuyao Sun, Zilu Zhang, Leping Huang, Jianliang Zeng, Mao Shu, and Huo Cao. InternVL-X：通过高效视觉 词元 压缩推进并加速 InternVL 系列。 arXiv preprint arXiv:2503.21307, 2025.
+[29] Haozhe Wang, Alex Su, Weiming Ren, Fangzhen Lin, and Wenhu Chen. Pixel Reasoner：通过好奇心驱动的强化学习激励像素空间推理。 载于：NeurIPS, 2025.
+[30] Xintong Zhang, Zhi Gao, Bofei Zhang, Pengxiang Li, Xiaowen Zhang, Yang Liu, Tao Yuan, Yuwei Wu, Yunde Jia, Song-Chun Zhu, et al. Chain-of-Focus：通过强化学习实现面向多模态推理的自适应视觉搜索与放大。 arXiv preprint arXiv:2505.15436, 2025.
+[31] Zeyi Huang, Yuyang Ji, Anirudh Sundara Rajan, Zefan Cai, Wen Xiao, Haohan Wang, Junjie Hu, and Yong Jae Lee. 从经验中学习选择视觉工具。 载于：CVPR, 2026.
+[32] Guanghao Zhang, Tao Zhong, Yan Xia, Mushui Liu, Zhelun Yu, Haoyuan Li, Wanggui He, Dong She, Yi Wang, and Hao Jiang. CMMCoT：通过多模态思维链与记忆增强提升复杂多图理解。 载于：AAAI, 2026.
+===PAGE===
+## 参考文献 [33–49]
+[33] Jiacong Wang, Zijian Kang, Haochen Wang, Liang Xiao, Ya Wang, Jiawen Li, Bohong Wu, Jiao Ran, Haiyong Jiang, Chao Feng, and Jun Xiao. VGR：以视觉定位为依据的推理。 载于：ICLR, 2026.
+[34] Jiwan Chung, Junhyeok Kim, Siyeol Kim, Jaeyoung Lee, Min Soo Kim, and Youngjae Yu. 不要只看一次：通过选择性视觉重访实现多模态交互推理。 arXiv preprint arXiv:2505.18842, 2025.
+[35] Zhihong Shao, Peiyi Wang, Qihao Zhu, Runxin Xu, Junxiao Song, Xiao Bi, Haowei Zhang, Mingchuan Zhang, Y . K. Li, Y . Wu, and Daya Guo. DeepSeekMath：推进开放语言模型数学推理的极限。 载于：ICLR, 2025.
+[36] Ross Girshick. Fast R-CNN。 载于：ICCV, 2015.
+[37] Xiao Sun, Bin Xiao, Fangyin Wei, Shuang Liang, and Yichen Wei. 积分式人体姿态回归。 载于：ECCV, 2018.
+[38] Geng Li, Jinglin Xu, Yunzhen Zhao, and Yuxin Peng. DyFo：无需训练的动态聚焦视觉搜索，用于增强大型多模态模型的细粒度视觉理解。 载于：CVPR, 2025.
+[39] Haozhan Shen, Kangjia Zhao, Tiancheng Zhao, Ruochen Xu, Zilun Zhang, Mingwei Zhu, and Jianwei Yin. ZoomEye：通过基于树的图像探索赋予多模态大语言模型类人的缩放能力。 载于：EMNLP, 2025.
+[40] Wenbin Wang, Yongcheng Jing, Liang Ding, Yingjie Wang, Li Shen, Yong Luo, Bo Du, and Dacheng Tao. 检索增强感知：高分辨率图像感知与视觉 RAG 相结合。 载于：ICML, 2025.
+[41] Licheng Yu, Patrick Poirson, Shan Yang, Alexander C. Berg, and Tamara L. Berg. 指代表达中的上下文建模。 载于：ECCV, 2016.
+[42] Junhua Mao, Jonathan Huang, Alexander Toshev, Oana Camburu, Alan L. Yuille, and Kevin Murphy. 无歧义物体描述的生成与理解。 载于：CVPR, 2016.
+[43] Tsung-Yi Lin, Michael Maire, Serge Belongie, Lubomir Bourdev, Ross Girshick, James Hays, Pietro Perona, Deva Ramanan, Piotr Dollár, and C. Lawrence Zitnick. Microsoft COCO：上下文中的常见物体。 载于：ECCV, 2014.
+[44] Lucas Beyer, Andreas Steiner, André Susano Pinto, Alexander Kolesnikov, Xiao Wang, Daniel Salz, Maxim Neumann, Ibrahim Alabdulmohsin, Michael Tschannen, Emanuele Bugliarello, Thomas Unterthiner, Daniel Keysers, Skanda Koppula, Fangyu Liu, Adam Grycner, Alexey Gritsenko, Neil Houlsby, Manoj Kumar, Keran Rong, Julian Eisenschlos, Rishabh Kabra, Matthias Bauer, Matko Bošnjak, Xi Chen, Matthias Minderer, Paul V oigtlaender, Ioana Bica, Ivana Balazevic, Joan Puigcerver, Pinelopi Papalampidi, Olivier Henaff, Xi Xiong, Radu Soricut, Jeremiah Harmsen, and Xiaohua Zhai. PaliGemma：用于迁移的通用 3B 视觉语言模型。 arXiv preprint arXiv:2407.07726, 2024.
+[45] Manoj Acharya, Kushal Kafle, and Christopher Kanan. TallyQA：回答复杂计数问题。 载于：AAAI, 2019.
+[46] Dan Hendrycks, Collin Burns, Steven Basart, Andy Zou, Mantas Mazeika, Dawn Song, and Jacob Steinhardt. 衡量大规模多任务语言理解。 载于：ICLR, 2021.
+[47] Karl Cobbe, Vineet Kosaraju, Mohammad Bavarian, Mark Chen, Heewoo Jun, Lukasz Kaiser, Matthias Plappert, Jerry Tworek, Jacob Hilton, Reiichiro Nakano, Christopher Hesse, and John Schulman. 训练验证器以求解数学应用题。 arXiv preprint arXiv:2110.14168, 2021.
+[48] Amanpreet Singh, Vivek Natarajan, Meet Shah, Yu Jiang, Xinlei Chen, Dhruv Batra, Devi Parikh, and Marcus Rohrbach. 迈向能够阅读的 VQA 模型。 载于：CVPR, 2019.
+[49] Minesh Mathew, Dimosthenis Karatzas, and CV Jawahar. DocVQA：面向文档图像视觉问答的数据集。 载于：WACV, 2021.
+===PAGE===
+## 参考文献 [50–57]
+[50] Jordy Van Landeghem, Rubèn Tito, Łukasz Borchmann, Michał Pietruszka, Pawel Joziak, Rafal Powalski, Dawid Jurkiewicz, Mickaël Coustaty, Bertrand Anckaert, Ernest Valveny, et al. 文档理解数据集与评估（DUDE）。 载于：ICCV, 2023.
+[51] Zheng Huang, Kai Chen, Jianhua He, Xiang Bai, Dimosthenis Karatzas, Shijian Lu, and CV Jawahar. ICDAR2019 扫描收据 OCR 与信息抽取竞赛。 载于：ICDAR, 2019.
+[52] Minesh Mathew, Viraj Bagal, Rubèn Tito, Dimosthenis Karatzas, Ernest Valveny, and CV Jawa- har. InfographicVQA（信息图视觉问答）。 载于：WACV, 2022.
+[53] Bryan A Plummer, Liwei Wang, Chris M Cervantes, Juan C Caicedo, Julia Hockenmaier, and Svetlana Lazebnik. Flickr30k Entities：收集区域与短语对应关系，构建更丰富的图像到句子模型。 载于：ICCV, 2015.
+[54] Yuke Zhu, Oliver Groth, Michael Bernstein, and Li Fei-Fei. Visual7W：图像中基于定位的问答。 载于：CVPR, 2016.
+[55] Drew A Hudson and Christopher D Manning. GQA：用于真实世界视觉推理与组合式问答的新数据集。 载于：CVPR, 2019.
+[56] Lei Li, Yuqi Wang, Runxin Xu, Peiyi Wang, Xiachong Feng, Lingpeng Kong, and Qi Liu. Multimodal ArXiv：用于提高大型视觉语言模型科学理解能力的数据集。 载于：ACL, 2024.
+[57] Xiyao Wang, Zhengyuan Yang, Chao Feng, Hongjin Lu, Linjie Li, Chung-Ching Lin, Kevin Lin, Furong Huang, and Lijuan Wang. 用更少数据达到最先进水平：通过 MCTS 引导样本选择，实现数据高效的视觉推理自我改进。 载于：NeurIPS, 2025.
+## 附录 A 实现细节
+## A.1 数据集
+为与既有视觉思维链方法公平比较，使用与相应骨干完全相同的训练数据。
+**监督微调（SFT）。** 采用按 Vis-CoT [2] 协议构建的 Visual-CoT 数据集。从 12 个公开数据集收集图像和标注，覆盖文本/文档理解、细粒度视觉识别、通用视觉问答、图表理解和关系推理五个领域。来源主要是 VQA 与图像描述基准，复用图像及问答对、描述、目标框、目标关系等标注。
+数据构建包括语言和视觉标注。语言标注利用 GPT-4 生成或完善问答对，并在适用时生成中间推理步骤。视觉标注确定任务相关区域，作为视觉 CoT 定位信号。在 TextVQA、DocVQA、DUDE、SROIE、InfographicsVQA 等文本密集领域，使用 PaddleOCR 等 OCR 工具检测文本区域，将直接支持答案的词语或句子所在区域定义为 CoT 框。细粒度识别任务使用有判别力的物体部位或属性框指导推理。
+在 Flickr30k、Visual7W、VSR、GQA 等通用 VQA 和关系推理任务中，利用物体级标注和场景图信息；视觉 CoT 框对应明确参与问题回答的物体或区域，例如具有空间关系的物体或问题指定的属性。尤其对 GQA，使用结构化语义标注识别目标及关系，精确定位中间推理步骤。
+SFT 的每个样本包含图像、问题、由边界框表示的一系列中间视觉定位步骤和最终答案。模型联合学习文本输出与连续边界框坐标预测，在显式监督下学习基于区域的视觉推理。
+===PAGE===
+**强化学习（RL）。** 使用与 DeepEyes [1] 相同的数据与协议。不同于 SFT，RL 不依赖任何显式中间框标注，而只通过结果级监督优化，更符合缺少细粒度视觉定位标签的实际情况。
+RL 训练数据强调具有工具意识的视觉推理，包含三个互补子集：细粒度视觉搜索、图表理解和通用推理。细粒度子集采样自 V* 训练集的一部分，聚焦高分辨率图像与精细感知任务，此类任务必须观察局部才能正确回答。图表子集来自 ArxivQA，包含合成曲线图、示意图和结构化图形表示，将视觉模态从自然图像扩展得更加多样。还纳入 ThinkLite-VL 的部分样本，以增加算术、常识和多步问题求解等推理多样性。
+随后采用专门的数据筛选流程。首先，让强视觉语言模型为每题生成多个回答，以答案一致性估计难度，剔除过于简单或极难的样本。其次，将原问题改写为开放式问题以适配生成训练目标，丢弃无法可靠转换者。第三，移除无法验证的样例，包括问题含糊、标注错误或视觉内容不可读的情况。最后，由于图表数据天然依赖视觉结构，不对其执行该过滤步骤；推理数据保持原始形式。
+## A.2 评估协议
+**推理提示。** RL 与 SFT 使用不同模板，反映各自训练目标和监督信号。RL 的结构化提示明确鼓励逐步推理与有条件使用工具：先思考，必要时调用图像放大工具进行细粒度观察，最后按严格格式作答。推理、工具调用和最终答案分离，有利于可靠解析轨迹及在策略优化中计算结果驱动奖励。
+SFT 使用面向定位的提示，明确要求预测框坐标以识别任务相关区域，并根据原图与局部图回答问题。这样能在框监督下学习显式视觉定位，加强区域选择和下游推理对齐。
+**RL 评估提示模板：**
+先思考，必要时调用 image_zoom_in_tool，然后回答。严格采用以下格式：
+<think>……</think>
+<tool_call>……</tool_call>（需要工具时）
+<answer>……</answer>
+**SFT 评估提示模板：**
+请提供能帮助你更好回答问题的区域的边界框坐标。根据原始图像和局部图像回答问题。
+## A.3 坐标与裁剪处理
+迭代放大时，预测边界框采用原始图像的全局坐标系。裁剪前，必要时将归一化坐标转换为像素坐标，并针对图像填充进行调整；最终裁剪窗口被限制在图像边界内。
+===PAGE===
+对于角点顺序无效的坐标，不重新排序，而是围绕平均中心、以最小裁剪尺寸构造窗口，再将其限制于图像边界。无效坐标在 RL 训练早期更常见，随后快速减少；推理阶段未观察到此现象。
+## A.4 更多实验结果
+**图 7：更多边界框可视化。** NV-CoT（红框）相对骨干（蓝框）产生更准确的边界框，显示定位能力改善。
+图中问答：什么东西接触着猫？真实答案：雨伞；NV-CoT：雨伞；Vis-CoT：球。另一张图中同一问题，真实答案：甜甜圈；NV-CoT：甜甜圈；Vis-CoT：杯子。表格编号是多少？真实答案：表 II；NV-CoT：表 II；Vis-CoT：表 12。午休是什么时候？真实答案：13:00–14:00；NV-CoT：13:00–14:00；Vis-CoT：12:30–13:00。
+**补充可视化。** 图 7 提供更多定性样例。与正文一致，骨干（蓝色）倾向于给出粗糙或对齐松散的框，NV-CoT（红色）则更贴合物体范围，表明定位质量提高。
+## 附录 B 影响声明
+本研究主要旨在推进 MLLM 的视觉推理能力，尤其是更准确、高效的区域定位。通过连续数值表示对图像推理，可提高定位精度和训练效率，可能惠及视觉问答、光学字符识别等众多下游应用。
+同时，更强的视觉定位和推理也可能用于敏感领域。不过，本文没有引入新的数据来源、可部署系统或应用专用流程，而依赖研究界广泛使用的标准基准数据。因此，我们认为其没有引入超出 MLLM 领域已广泛认识到的范围的新伦理风险。
+===PAGE===
+## NeurIPS 论文检查清单
+## 1. 主张
+**问题：** 摘要与引言的主要主张是否准确反映论文贡献和范围？
+**回答：是。** 理由：摘要和引言描述了视觉 CoT 的连续数值框预测，§3 和 §4 在所列基准上评估 SFT 与 RL 变体。
+**指南：** “不适用”表示摘要和引言未包含论文主张。摘要和/或引言应清楚说明主张、贡献、重要假设及局限；回答“否”或“不适用”会给评审留下不佳印象。主张应匹配理论和实验结果，并反映推广到其他设置的合理程度。可以将愿景作为动机，但必须明确论文尚未实现这些目标。
+## 2. 局限
+**问题：** 是否讨论作者所做工作的局限？
+**回答：是。** 理由：§5 讨论了局限。
+**指南：** “不适用”表示没有局限，“否”表示存在但未讨论。鼓励单设“局限”一节。应指出强假设，以及假设被违反时结果是否稳健，例如独立、无噪声、模型设定正确、仅局部成立的渐近近似，并反思实践中的违反情形与后果。应考虑主张适用范围，例如是否仅在少数数据集或少量运行上测试，并明确实证结果的隐含假设。
+应反思影响性能的因素：例如人脸识别在低分辨率或暗光下较差，语音转文字因无法处理术语而不适合在线讲座字幕。应讨论计算效率及随数据规模增长的扩展性，适用时讨论解决隐私、公平问题的局限。
+作者可能担心坦诚局限被用作拒稿理由，但更糟的是评审发现未承认的局限。作者应作出最佳判断，认识到透明行为有助于形成维护研究共同体诚信的规范。评审会被明确告知，不应因诚实陈述局限而惩罚作者。
+## 3. 理论假设和证明
+**问题：** 对每项理论结果，是否提供完整假设与完整、正确的证明？
+===PAGE===
+**回答：不适用。** 理由：论文提供方法推导与实验结果，没有需要证明的定理或正式理论结果。
+**指南：** “不适用”表示不包含理论结果。全部定理、公式和证明应编号并交叉引用；定理陈述中应明确列出或引用所有假设。证明可在正文或补充材料中，若在补充材料，鼓励在正文给出简短证明思路以建立直觉。反过来，正文中的非正式证明应在附录或补充材料中辅以正式证明。证明所依赖的定理、引理应恰当引用。
+## 4. 实验结果可复现性
+**问题：** 无论是否提供代码和数据，是否完整披露了复现主要实验结果所需、且影响主要主张或结论的全部信息？
+**回答：是。** 理由：§3、§4.1 描述方法和训练配置，附录提供数据集、评估协议与提示细节。
+**指南：** “不适用”表示没有实验。如果有实验却回答“否”，评审不会认可：不论是否提供代码数据，可复现性都重要。若贡献是数据集和/或模型，应说明如何复现或验证。
+可复现有多种方式。例如，新架构可以通过完整描述架构实现；特定模型及其实验评估，则应提供在同样数据上复现的方法或模型访问权限。发布代码数据通常是良好方式，也可提供详细复现实验说明、托管模型访问权限或适合该研究的模型检查点。
+NeurIPS 虽不强制发布代码，但要求为所有投稿提供与贡献相适应的合理复现途径。例如：（a）若主要贡献是算法，应明确如何复现；（b）若是架构，应完整清晰描述；（c）若是新的大型模型，应提供访问途径，或利用公开数据集、数据集构建说明等实现复现；（d）对于难以复现的特定情况，可说明适用的复现方式。闭源模型即使访问受限（例如仅限注册用户），也应为其他研究者保留某种复现或验证路径。
+## 5. 数据与代码的开放访问
+
+===PAGE===
+**问题：** 是否开放数据和代码，并提供足够说明，以按照补充材料忠实复现主要实验？
+**回答：是。** 理由：项目主页链接到公开 NV-CoT 代码仓库。论文和附录描述复现实验所需的方法、数据集、训练配置与评估提示。
+**指南：** “不适用”表示没有需代码的实验。详见 NeurIPS 代码和数据提交指南：https://neurips.cc/public/guides/CodeSubmissionPolicy 。鼓励发布代码数据，但理解有时无法做到，故“否”是可接受答案；除非代码数据本身是贡献核心（如新的开源基准），否则不能据此拒稿。
+说明应包含复现所需的确切命令与环境，详见上述指南；应说明如何获取、准备原始、预处理、中间及生成数据。应提供复现新方法和基线全部实验的脚本，若只能复现子集，应说明省略哪些实验及原因。投稿时应在适用情况下发布匿名版本。建议尽可能将更多信息放入补充材料，也允许提供代码数据链接。
+## 6. 实验设置与细节
+**问题：** 是否给出理解结果所需的所有训练与测试细节，包括数据划分、超参数及其选择方式、优化器类型？
+**回答：是。** 理由：§4.1 报告 SFT、RL 设置和评估协议，附录记录数据集与评估提示。
+**指南：** “不适用”表示无实验。正文应将设置描述到足以理解结果意义和合理性的程度；完整细节可以随代码提供，或放在附录、补充材料。
+## 7. 实验统计显著性
+**问题：** 是否恰当报告并正确定义误差棒，或提供其他适当的统计显著性信息？
+**回答：否。** 理由：表和图仅提供点估计，没有误差棒、置信区间或显著性检验。
+**指南：** “不适用”表示无实验。若结果附有误差棒、置信区间或统计显著性检验，至少覆盖支持主要主张的实验，则应回答“是”。
+===PAGE===
+应明确误差棒捕获哪些变异来源，例如训练/测试划分、初始化、某个参数的随机抽取，或给定条件下的整体运行。应解释误差棒如何计算，例如闭式公式、库函数或自助法，并给出假设，例如误差服从正态分布。应明确误差棒表示标准差还是均值标准误。
+可以报告 1σ 误差棒，但应说明。在未验证误差正态性时，作者最好报告 2σ 误差棒，而非声称具有 96% 置信区间。对于非对称分布，应避免绘制导致超出取值范围（例如负错误率）的对称误差棒。若表或图报告误差棒，正文应说明计算方法并引用对应图表。
+## 8. 实验计算资源
+**问题：** 是否为每项实验提供足够计算资源信息（计算设备类型、内存、执行时间），以便复现？
+**回答：是。** 理由：§4.1 报告使用 32 张 A100 进行 80 次 RL 迭代，批量 256，GRPO 组大小 16，说明主要 RL 实验的硬件与规模。
+**指南：** “不适用”表示无实验。应说明 CPU/GPU、内部集群或云服务商，以及相关内存、存储；应给出各实验运行的计算量和总计算量估计，并披露整个项目是否消耗了更多计算资源，例如未纳入论文的预实验或失败实验。
+## 9. 伦理准则
+**问题：** 研究是否在所有方面符合 NeurIPS 伦理准则 https://neurips.cc/public/EthicsGuidelines ？
+**回答：是。** 理由：使用既有基准，不招募人类参与者；未报告偏离伦理准则。
+**指南：** “不适用”表示作者没有审阅伦理准则。若回答“否”，应解释必须偏离的特殊情况。应确保匿名性，例如所在司法辖区法律法规造成特殊考虑时。
+## 10. 更广泛的影响
+**问题：** 是否讨论工作潜在的正面与负面社会影响？
+**回答：是。**
+===PAGE===
+**理由：** 影响声明讨论视觉问答和 OCR 的潜在益处，并指出更强视觉推理可能用于敏感领域。
+**指南：** “不适用”表示没有社会影响。回答“不适用”或“否”时，应说明为何没有社会影响或为何不讨论。负面影响例子包括恶意或非预期用途（虚假信息、虚假个人档案、监控）、公平性（导致不公地影响特定群体的决策）、隐私和安全。
+大会理解许多论文属于基础研究，未绑定具体应用或部署；但若存在通向负面用途的直接路径，应指出。例如，改进生成模型可能用于制作传播虚假信息的深度伪造；但无需指出通用神经网络优化算法可使深度伪造训练更快。
+应考虑技术按预期正确运行时的危害、按预期使用但结果错误时的危害，以及有意或无意滥用的危害。存在负面影响时，可讨论缓解策略，例如限制模型发布、同时提供防御措施、监测滥用、监测系统如何随反馈学习，以及提高机器学习效率与可访问性。
+## 11. 防护措施
+**问题：** 是否说明为负责任发布高滥用风险的数据或模型所采取的防护，例如预训练语言模型、图像生成器、抓取数据集？
+**回答：不适用。** 理由：未描述发布需要防护的高风险数据集、预训练模型或部署系统。
+**指南：** “不适用”表示无此类风险。高滥用或双重用途风险模型发布时，应配备受控使用防护，例如要求遵守使用指南、访问限制或安全过滤。网络抓取数据可能有风险，应说明如何避免发布不安全图像。有效防护很困难，许多论文无需此类措施，但鼓励适用时尽力考虑。
+## 12. 既有资源的许可证
+**问题：** 是否适当致谢代码、数据、模型等资源的创作者或原所有者，并明确说明、遵守许可证与使用条款？
+**回答：否。** 理由：§4.1 与附录等引用了数据集和既有方法，但未明确列出许可证或使用条款。
+**指南：** “不适用”表示未使用既有资源。
+===PAGE===
+应引用生成代码包或数据集的原论文；说明使用版本，尽可能提供网址。每项资源均应给出许可证名称，例如 CC-BY 4.0。对于从特定来源（如网站）抓取的数据，应提供来源的版权与服务条款。发布资源时，应在包中提供许可证、版权和使用条款。常见数据集可参考 paperswithcode.com/datasets 的许可证资料与指南。重新打包既有数据集时，应同时提供原许可证与派生资源的许可证（若有变化）。若网上查不到，鼓励联系创作者。
+## 13. 新资源
+**问题：** 论文引入的新资源是否文档完善，并随资源提供文档？
+**回答：不适用。** 理由：稿件未描述发布新的数据集、代码包或模型资源，而是呈现方法和实验结果。
+**指南：** “不适用”表示未发布新资源。研究者应通过结构化模板提供数据集/代码/模型细节，包括训练、许可证、局限等。应讨论如何获得资源涉及人员的同意。投稿时注意匿名化资源，可采用匿名网址或匿名压缩包。
+## 14. 众包与人类受试者研究
+**问题：** 对众包或人类受试者实验，是否给出向参与者提供的完整说明及适用截图，并说明报酬（如有）？
+**回答：不适用。** 理由：研究使用既有数据集，没有众包或从人类参与者收集新数据。
+**指南：** “不适用”表示不涉及众包或受试者研究。信息可放补充材料，但若主要贡献涉及受试者，应尽量放在正文。按 NeurIPS 伦理准则，从事数据收集、整理或其他劳动的工作人员，至少应获得数据收集者所在国家的最低工资。
+## 15. 机构审查委员会（IRB）或同等受试者研究审批
+**问题：** 是否描述参与者可能遭遇的风险、是否向其披露风险，以及是否获得 IRB 或所在国家/机构要求的同等审批？
+**回答：不适用。**
+===PAGE===
+**理由：** 本研究不涉及人类受试者实验或参与者招募，因此不适用 IRB 审查。
+**指南：** “不适用”表示不涉及众包或受试者研究。视研究所在国家而定，任何受试者研究都可能需要 IRB 或同等审批；获得审批时应明确说明。各机构与地区程序差异很大，作者应遵循 NeurIPS 伦理准则及所在机构指南。首次投稿时，适用情况下不要包含破坏匿名性的信息，例如审查机构名称。
+## 16. 大语言模型使用声明
+**问题：** 若 LLM 是核心研究方法中重要、原创或非标准的组成部分，是否说明其使用？若仅用于写作、编辑或排版，且不影响核心方法、科学严谨性或原创性，则无需声明。
+**回答：是。** 理由：§A.1 说明语言标注中使用 GPT-4 生成或完善训练问题、答案与推理步骤；方法本身在 §3 描述。
+**指南：** “不适用”表示核心方法开发中，LLM 并非重要、原创或非标准的组成部分。有关哪些使用应当或不应当说明，请参阅 NeurIPS 手册的 LLM 政策。

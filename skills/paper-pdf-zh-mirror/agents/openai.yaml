@@ -1,0 +1,4 @@
+interface:
+  display_name: "科研论文中文镜像 PDF"
+  short_description: "保留原文图片、公式与分页，将英文论文转换成学术排版的中文 PDF"
+  default_prompt: "使用 $paper-pdf-zh-mirror 将这篇英文论文转换成保留原版布局的中文 PDF，并按最终字体层级验收。"
